@@ -28,6 +28,8 @@ async-stream = "0.3.3"
 thiserror = "1.0"
 native-tls = "0.2.10"
 url = "2.2.2"
+ureq = {version = "2.4.0", features=["json","socks-proxy", "native-tls"]}
+
 
 [dev-dependencies]
 cargo-tarpaulin = "0.18.5"

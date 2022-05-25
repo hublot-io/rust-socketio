@@ -144,7 +144,6 @@ impl ClientBuilder {
         if self.handshake.is_some() {
             return Ok(());
         }
-
         // Start with polling transport
         let transport = PollingTransport::new(
             self.url.clone(),

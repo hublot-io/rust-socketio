@@ -6,12 +6,45 @@ use reqwest::{
     blocking::{Client, ClientBuilder},
     header::HeaderMap,
 };
+use ureq::{Agent, AgentBuilder,Request, MiddlewareNext,Response, Middleware, Error as UreqError};
+use std::time::Duration;
+use std::io::Read;
 use std::sync::{Arc, Mutex, RwLock};
 use url::Url;
 
+pub struct MiddlewareState {
+    pub headers: HeaderMap
+}
+pub struct HeadersMiddleware(pub Arc<Mutex<MiddlewareState>>);
+
+ impl Middleware for HeadersMiddleware {
+    fn handle(&self, mut request: Request, next: MiddlewareNext) -> std::result::Result<Response, UreqError>{
+            let req = request.clone();
+        // inner scope so we release the lock asap
+            let state = self.0.lock().unwrap();
+            let map = &state.headers;
+            // TODO: implem custom headers
+            
+            // for h in map.clone() {
+
+            //     if let Some(head) = h.0 {
+            //         match h.1.to_str(){
+            //             Ok(val_as_str) =>{ 
+            //                 req.set(head.as_str(),val_as_str);
+            //             },
+            //             Err(_e) => {
+            //                 println!("Cannot set heander {:?} into this request, value might be invalid", head);
+            //             }
+            //         };
+            //     };
+            // }; 
+        next.handle(req)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PollingTransport {
-    client: Arc<Mutex<Client>>,
+    client: Arc<Mutex<Agent>>,
     base_url: Arc<RwLock<Url>>,
 }
 
@@ -22,25 +55,38 @@ impl PollingTransport {
         tls_config: Option<TlsConnector>,
         opening_headers: Option<HeaderMap>,
     ) -> Self {
-        let client = match (tls_config, opening_headers) {
-            (Some(config), Some(map)) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .default_headers(map)
-                .build()
-                .unwrap(),
-            (Some(config), None) => ClientBuilder::new()
-                .use_preconfigured_tls(config)
-                .build()
-                .unwrap(),
-            (None, Some(map)) => ClientBuilder::new().default_headers(map).build().unwrap(),
-            (None, None) => Client::new(),
+        let agent : Agent =  match (tls_config, opening_headers) {
+            (Some(config), Some(map)) =>{
+                let headers = Arc::new(Mutex::new(MiddlewareState{
+                    headers: map.clone()
+                }));
+                let connector = Arc::new(config);
+                let agent = AgentBuilder::new()
+                .tls_connector(connector)
+                .middleware(HeadersMiddleware(headers.clone()))
+                .build();
+                agent
+            },
+            (Some(config), None) =>{ 
+                let connector = Arc::new(config);
+                AgentBuilder::new()
+                    .tls_connector(connector)
+                    .build()
+            },
+            (None, Some(map)) => {
+                let headers = Arc::new(Mutex::new(MiddlewareState{
+                    headers: map.clone()
+                }));
+                AgentBuilder::new().middleware(HeadersMiddleware(headers.clone())).build()
+            },
+            (None, None) => Agent::new(),
         };
 
         let mut url = base_url;
         url.query_pairs_mut().append_pair("transport", "polling");
 
         PollingTransport {
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(Mutex::new(agent)),
             base_url: Arc::new(RwLock::new(url)),
         }
     }
@@ -62,11 +108,10 @@ impl Transport for PollingTransport {
         };
         let client = self.client.lock()?;
         let status = client
-            .post(self.address()?)
-            .body(data_to_send)
-            .send()?
-            .status()
-            .as_u16();
+            .post(self.address()?.as_str()) 
+            .send_bytes(&data_to_send)
+            .expect("[Transport] cannot emit byers")
+            .status();
 
         drop(client);
 
@@ -79,7 +124,14 @@ impl Transport for PollingTransport {
     }
 
     fn poll(&self) -> Result<Bytes> {
-        Ok(self.client.lock()?.get(self.address()?).send()?.bytes()?)
+        let response = self.client.lock()?.get(self.address()?.as_str()).call().expect("[Transport] polling error");
+        let len = response.header("Content-Length")
+            .and_then(|s| s.parse::<usize>().ok()).unwrap();
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(len);
+        response.into_reader().read_to_end(&mut bytes)?;
+        let resp:  bytes::Bytes = bytes::Bytes::from(bytes); 
+        Ok(resp)
     }
 
     fn base_url(&self) -> Result<Url> {
